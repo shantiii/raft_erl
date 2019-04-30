@@ -1,9 +1,9 @@
 -module(raft_log).
 
--export([new/1, last_index/1]).
+-export([new/1, last_index/1, commit_index/1, applied_index/1]).
 -export([at/2, term_at/2, op_at/2]).
 
--record(state, {oplist=[], state=[], applied_idx=0}).
+-record(state, {oplist=[], state=[], applied_idx=0, commit_idx=0}).
 -record(op, {f=fun(X)->X end, args=[]}).
 
 new(Init) -> #state{oplist=[{0, op(fun first_op/2, [Init])}]}.
@@ -12,6 +12,10 @@ op(Fun, Args) ->
     #op{f=Fun, args=Args}.
 
 last_index(#state{oplist=Log}) -> length(Log).
+
+applied_index(#state{applied_idx=Idx}) -> Idx.
+
+commit_index(#state{commit_idx=Idx}) -> Idx.
 
 append(#state{oplist=Log}=State, Term, Op) ->
     State#state{oplist=Log ++ [{Term, Op}]}.

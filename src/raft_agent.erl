@@ -59,18 +59,14 @@ handle_event(enter, _PrevState, candidate, #state{term=Term,id=Id}=Data0) ->
 
 
 % if we are out of date, revert to follower
-handle_event(cast, {rpc, request_vote, Term, {Candidate, _CLI, _CLT}}=EventData, _State, #state{term=CurrentTerm}=Data) when Term > CurrentTerm ->
+handle_event(cast, {rpc, _RpcType, Term, _Payload}=EventData, _State, #state{term=CurrentTerm}=Data) when Term > CurrentTerm ->
     {next_state, follower, Data#state{term=Term, voted_for=[]}, [{next_event, cast, EventData}]};
 
 handle_event(cast, {rpc, request_vote, Term, {Candidate, _LastIdx, _LastTerm}}, _State, #state{term=CurrentTerm}) when Term < CurrentTerm ->
     send(Candidate, {ack, request_vote, CurrentTerm, false}),
     keep_state_and_data;
 
-handle_event(cast, {rpc, request_vote, Term, {Candidate, _LastIdx, _LastTerm}}, _State, #state{term=CurrentTerm}) when Term < CurrentTerm ->
-    send(Candidate, {ack, request_vote, CurrentTerm, false}),
-    keep_state_and_data;
-
-handle_event(cast, {rpc, request_vote, Term, {Candidate, CLastIndex, CLastTerm}}, follower, #state{term=CurrentTerm,log=Log,voted_for=VotedFor}=Data) ->
+handle_event(cast, {rpc, request_vote, CurrentTerm, {Candidate, CLastIndex, CLastTerm}}, follower, #state{term=CurrentTerm,log=Log,voted_for=VotedFor}=Data) ->
     LastIndex = raft_log:last_index(Log),
     LastTerm = raft_log:term_at(Log, LastIndex),
     Result = 
@@ -92,6 +88,13 @@ handle_event(cast, {rpc, request_vote, Term, {Candidate, CLastIndex, CLastTerm}}
             keep_state_and_data
     end;
 
+handle_event(cast, {rpc, append_entries, Term, {LeaderId, _PrevLogIndex, _PrevLogTerm, [] = _Entries, _LeaderCommit}}, _Role, #state{term=Term}) ->
+    send(LeaderId, {ack, append_entries, Term, true}),
+    keep_state_and_data;
+
+handle_event(cast, {ack, append_entries, Term, true}, leader, #state{term=Term}) ->
+    keep_state_and_data;
+
 handle_event(cast, {ack, request_vote, Term, true}, candidate, #state{term=Term,votes_gathered=Votes,cluster=Cluster}=Data) ->
     NewVotes = Votes+1,
     NewData = Data#state{votes_gathered=NewVotes},
@@ -103,8 +106,14 @@ handle_event(cast, {ack, request_vote, Term, true}, candidate, #state{term=Term,
     end;
 
 %% Leader Mode!
+handle_event(enter, leader, leader, Data) ->
+    handle_event(enter, candidate, leader, Data);
 handle_event(enter, candidate, leader, Data) ->
-    keep_state_and_data;
+    % send to all members
+    Peers = peers(Data),
+    SendHeartbeat = fun(Server) -> send(Server, rpc(append_entries, Data)) end,
+    lists:foreach(SendHeartbeat, Peers),
+    {keep_state_and_data, [action_heartbeat()]};
 
 %% Mostly Ignore votes we gather after being elected
 handle_event(cast, {ack, request_vote, Term, Success}, leader, #state{term=Term,votes_gathered=Votes}=Data) ->
@@ -115,6 +124,9 @@ handle_event(cast, {ack, request_vote, Term, Success}, leader, #state{term=Term,
             keep_state_and_data
     end;
 
+handle_event(state_timeout, heartbeat, leader, #state{}) ->
+    repeat_state_and_data;
+
 handle_event(timeout, election, candidate, #state{}) ->
     repeat_state_and_data.
 
@@ -123,6 +135,13 @@ handle_event(timeout, election, candidate, #state{}) ->
 %%
 
 %% A message
+
+rpc(append_entries, #state{term=Term,id=Id,log=Log}) ->
+    PrevLogIndex = 0,
+    PrevLogTerm = 0,
+    % TODO: populate entries
+    Entries = [],
+    {rpc, append_entries, Term, {Id, PrevLogIndex, PrevLogTerm, Entries, raft_log:commit_index(Log)}};
 rpc(request_vote, #state{term=Term,id=Id,log=Log}) ->
     LastIndex = raft_log:last_index(Log),
     {rpc, request_vote, Term, {Id, LastIndex, raft_log:term_at(Log, LastIndex)}}.
@@ -140,8 +159,11 @@ heartbeat_timeout() ->
 action_reset_election() ->
     {timeout, election_timeout(), election}.
 
-action_retry_rpc(RpcData) ->
-    {state_timeout, heartbeat_timeout(), {retry, RpcData}}.
+action_heartbeat() ->
+    {state_timeout, heartbeat_timeout(), heartbeat}.
+
+%action_retry_rpc(RpcData) ->
+%    {state_timeout, heartbeat_timeout(), {retry, RpcData}}.
 
 parse_args(Args) -> parse_args(Args, #state{}).
 
