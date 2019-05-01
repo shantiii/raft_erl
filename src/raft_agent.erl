@@ -88,12 +88,23 @@ handle_event(cast, {rpc, request_vote, CurrentTerm, {Candidate, CLastIndex, CLas
             keep_state_and_data
     end;
 
-handle_event(cast, {rpc, append_entries, Term, {LeaderId, _PrevLogIndex, _PrevLogTerm, [] = _Entries, _LeaderCommit}}, _Role, #state{term=Term}) ->
-    send(LeaderId, {ack, append_entries, Term, true}),
+handle_event(cast, {rpc, append_entries, Term, {LeaderId, _PrevLogIndex, _PrevLogTerm, [] = _Entries, _LeaderCommit}}, _Role, #state{id=Id, term=Term}) ->
+    send(LeaderId, {ack, append_entries, Term, Id, true}),
     keep_state_and_data;
 
-handle_event(cast, {ack, append_entries, Term, true}, leader, #state{term=Term}) ->
-    keep_state_and_data;
+handle_event(cast, {rpc, append_entries, Term, {LeaderId, PrevLogIndex, PrevLogTerm, Entries, LeaderCommit}}, _Role, #state{id=Id, term=Term, log=Log}=Data) ->
+    {Result, NewLog} =
+    case raft_log:term_at(Log, PrevLogIndex) of
+        PrevLogTerm ->
+            {false, Log};
+        _ ->
+            Log1 = raft_log:drop_after(Log, PrevLogIndex),
+            Log2 = raft_log:append_all(Log1, Entries),
+            Log3 = raft_log:commit(Log2, min(LeaderCommit, raft_log:last_index(Log2))),
+            {true, Log3}
+    end,
+    send(LeaderId, {ack, append_entries, Term, Id, Result}),
+    {keep_state, Data#state{log=NewLog}};
 
 handle_event(cast, {ack, request_vote, Term, true}, candidate, #state{term=Term,votes_gathered=Votes,cluster=Cluster}=Data) ->
     NewVotes = Votes+1,
@@ -111,9 +122,45 @@ handle_event(enter, leader, leader, Data) ->
 handle_event(enter, candidate, leader, Data) ->
     % send to all members
     Peers = peers(Data),
-    SendHeartbeat = fun(Server) -> send(Server, rpc(append_entries, Data)) end,
+    SendHeartbeat = fun(Server) -> send(Server, rpc(heartbeat, Data)) end,
+    LastLogIndex = raft_log:last_index(Data#state.log),
+    NextIndex = maps:from_list(lists:map(fun (Peer) -> {Peer, LastLogIndex + 1} end, Peers)),
+    MatchIndex = maps:from_list(lists:map(fun (Peer) -> {Peer, 0} end, Peers)),
     lists:foreach(SendHeartbeat, Peers),
-    {keep_state_and_data, [action_heartbeat()]};
+    {keep_state, Data#state{ldr_match_index=MatchIndex,ldr_next_index=NextIndex}, [action_heartbeat()]};
+
+handle_event(cast, {client_req, Client, OpAndArgs}, leader, #state{term=Term,log=Log}=Data) -> 
+    NewLog = raft_log:append(Log, Term, OpAndArgs),
+    {keep_state, Data#state{log=NewLog}, [{next_event, internal, check_followers}]};
+
+handle_event(internal, check_followers, leader, #state{cluster=Cluster,log=Log,ldr_next_index=NextIndices}=Data) ->
+    LastIndex = raft_log:last_index(Log),
+    AllPeers = peers(Cluster),
+    CheckFn = fun(Peer) ->
+                      #{Peer := NextIndex} = NextIndices,
+                      LastIndex >= NextIndex
+              end,
+    OutOfDatePeers = lists:filter(CheckFn, AllPeers),
+    SendAppendEntries = fun(Peer) -> send(Peer, rpc(append_entries, Peer, Data)) end,
+    lists:foreach(SendAppendEntries, OutOfDatePeers),
+    keep_state_and_data;
+
+handle_event(cast, {ack, append_entries, Term, FollowerId, false}, leader, #state{ldr_next_index=NextIndices,log=Log}=Data) ->
+    NewNextIndices = maps:update_with(FollowerId, fun(Value) -> Value-1 end, NextIndices),
+    NewData = Data#state{ldr_next_index=NewNextIndices},
+    send(FollowerId, rpc(append_entries, NewData)),
+    {keep_state, NewData};
+
+handle_event(cast, {ack, append_entries, Term, FollowerId, true}, leader, #state{ldr_match_index=MatchIndices, ldr_next_index=NextIndices,log=Log,cluster=Cluster}=Data) ->
+    NewNextIndices = NextIndices#{FollowerId => raft_log:last_index(Log)},
+    NewMatchIndices = MatchIndices#{FollowerId => raft_log:last_index(Log)},
+    % if SOME INDEX is replicated to a majority of followers, commit that index (the highest SOME INDEX)
+    % That index will be the median of the indices in NextIndices
+    SortedIndices = lists:sort(maps:values(NewMatchIndices)),
+    MedianIndex = length(Cluster) div 2,
+    MajorityCommitted = lists:nth(MedianIndex + 1, SortedIndices),
+    NewLog = raft_log:commit(Log, MajorityCommitted),
+    {keep_state, Data#state{log=NewLog, ldr_next_index=NewNextIndices}};
 
 %% Mostly Ignore votes we gather after being elected
 handle_event(cast, {ack, request_vote, Term, Success}, leader, #state{term=Term,votes_gathered=Votes}=Data) ->
@@ -136,7 +183,15 @@ handle_event(timeout, election, candidate, #state{}) ->
 
 %% A message
 
-rpc(append_entries, #state{term=Term,id=Id,log=Log}) ->
+rpc(append_entries, To, #state{ldr_next_index=NextIndices,term=Term,id=Id,log=Log}) ->
+    #{To := NextIndex} = NextIndices,
+    LastIndex = raft_log:last_index(Log),
+    PrevLogIndex = NextIndex - 1,
+    PrevLogTerm = raft_log:at(PrevLogIndex),
+    Entries = raft_log:sublist(Log, NextIndex),
+    {rpc, append_entries, Term, {Id, PrevLogIndex, PrevLogTerm, Entries, raft_log:commit_index(Log)}}.
+
+rpc(heartbeat, #state{term=Term,id=Id,log=Log}) ->
     PrevLogIndex = 0,
     PrevLogTerm = 0,
     % TODO: populate entries
