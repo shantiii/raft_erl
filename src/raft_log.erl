@@ -1,7 +1,7 @@
 -module(raft_log).
 
--export([new/1, last_index/1, commit_index/1, applied_index/1, commit/2, sublist/2]).
--export([append_all/3, drop_after/2]).
+-export([new/1, last_index/1, commit_index/1, applied_index/1, commit/2, sublist/2, op/2]).
+-export([append/3, append_all/3, drop_after/2]).
 -export([at/2, term_at/2, op_at/2]).
 
 -record(state, {oplist=[], state=[], applied_idx=0, commit_idx=0}).
@@ -19,17 +19,21 @@ applied_index(#state{applied_idx=Idx}) -> Idx.
 commit_index(#state{commit_idx=Idx}) -> Idx.
 
 commit(#state{oplist=Ops,state=State,commit_idx=OldIndex}=Log, NewIndex) when NewIndex > OldIndex ->
+    io:format("COMMITTING~n"),
     % foreach operation between NewIndex and OldIndex, apply that operation to state
     ToApply = lists:sublist(Ops, OldIndex, NewIndex - OldIndex),
     NewState = lists:foldl(fun({Op, Args}, Acc) -> apply(Op, [Acc|Args]) end, State, ToApply),
     Log#state{state=NewState, commit_idx=NewIndex};
 
 % Ignore NewIndex <= OldIndex
-commit(Log, _NewIndex) ->
+commit(Log, NewIndex) ->
+%    io:format("NOT COMMITTING~p~n Index:(~p)~n State:(~p)~n Log:(~p)~n", [self(), NewIndex, Log#state.state, Log#state.oplist]),
     Log.
 
+sublist(Log, Index) when Index >= length(Log#state.oplist) ->
+    [];
 sublist(Log, Index) ->
-    lists:nthtail(Log#state.oplist, Index).
+    lists:nthtail(Index, Log#state.oplist).
 
 drop_after(Log, Index) ->
     lists:sublist(Log#state.oplist, Index).

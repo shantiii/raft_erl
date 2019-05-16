@@ -8,7 +8,10 @@
 -export([callback_mode/0, init/1, handle_event/4]).
 
 %% Client API
-%-export([query/2, update/2]).
+-export([operate/2]).
+
+operate(ServerRef, Fun) ->
+    gen_statem:call(ServerRef, {client_req, raft_log:op(Fun, [])}, 500).
 
 % persisted state should be saved to disk after modification and before a callback returns
 -record(state, {
@@ -122,20 +125,33 @@ handle_event(enter, leader, leader, Data) ->
 handle_event(enter, candidate, leader, Data) ->
     % send to all members
     Peers = peers(Data),
-    SendHeartbeat = fun(Server) -> send(Server, rpc(heartbeat, Data)) end,
     LastLogIndex = raft_log:last_index(Data#state.log),
     NextIndex = maps:from_list(lists:map(fun (Peer) -> {Peer, LastLogIndex + 1} end, Peers)),
     MatchIndex = maps:from_list(lists:map(fun (Peer) -> {Peer, 0} end, Peers)),
-    lists:foreach(SendHeartbeat, Peers),
-    {keep_state, Data#state{ldr_match_index=MatchIndex,ldr_next_index=NextIndex}, [action_heartbeat()]};
+    NewData = Data#state{ldr_match_index=MatchIndex,ldr_next_index=NextIndex},
 
-handle_event(cast, {client_req, Client, OpAndArgs}, leader, #state{term=Term,log=Log}=Data) -> 
-    NewLog = raft_log:append(Log, Term, OpAndArgs),
+    SendHeartbeat = fun(Server) -> send(Server, rpc(append_entries, Server, NewData)) end,
+    lists:foreach(SendHeartbeat, Peers),
+    {keep_state, NewData, [action_heartbeat()]};
+
+handle_event({call, From}, {client_req, {op, Op, Args}}, leader, #state{term=Term,log=Log}=Data) -> 
+    Parent = self(),
+    ProxyOp =
+        fun(State) ->
+                {State, Response} = apply(Op, [State | Args]),
+                gen_statem:cast(Parent, {client_resp, From, Response}),
+                State
+        end,
+    NewLog = raft_log:append(Log, Term, {op, ProxyOp, []}),
     {keep_state, Data#state{log=NewLog}, [{next_event, internal, check_followers}]};
+
+handle_event(cast, {client_resp, To, Result}, leader, _Data) ->
+    gen_statem:reply(To, Result),
+    keep_state_and_data;
 
 handle_event(internal, check_followers, leader, #state{cluster=Cluster,log=Log,ldr_next_index=NextIndices}=Data) ->
     LastIndex = raft_log:last_index(Log),
-    AllPeers = peers(Cluster),
+    AllPeers = peers(Data),
     CheckFn = fun(Peer) ->
                       #{Peer := NextIndex} = NextIndices,
                       LastIndex >= NextIndex
@@ -152,6 +168,7 @@ handle_event(cast, {ack, append_entries, Term, FollowerId, false}, leader, #stat
     {keep_state, NewData};
 
 handle_event(cast, {ack, append_entries, Term, FollowerId, true}, leader, #state{ldr_match_index=MatchIndices, ldr_next_index=NextIndices,log=Log,cluster=Cluster}=Data) ->
+    %io:format("LEADER HEARTBEAT: ~p~n", [Data]),
     NewNextIndices = NextIndices#{FollowerId => raft_log:last_index(Log)},
     NewMatchIndices = MatchIndices#{FollowerId => raft_log:last_index(Log)},
     % if SOME INDEX is replicated to a majority of followers, commit that index (the highest SOME INDEX)
@@ -160,7 +177,7 @@ handle_event(cast, {ack, append_entries, Term, FollowerId, true}, leader, #state
     MedianIndex = length(Cluster) div 2,
     MajorityCommitted = lists:nth(MedianIndex + 1, SortedIndices),
     NewLog = raft_log:commit(Log, MajorityCommitted),
-    {keep_state, Data#state{log=NewLog, ldr_next_index=NewNextIndices}};
+    {keep_state, Data#state{log=NewLog, ldr_next_index=NewNextIndices, ldr_match_index=NewMatchIndices}};
 
 %% Mostly Ignore votes we gather after being elected
 handle_event(cast, {ack, request_vote, Term, Success}, leader, #state{term=Term,votes_gathered=Votes}=Data) ->
@@ -187,7 +204,7 @@ rpc(append_entries, To, #state{ldr_next_index=NextIndices,term=Term,id=Id,log=Lo
     #{To := NextIndex} = NextIndices,
     LastIndex = raft_log:last_index(Log),
     PrevLogIndex = NextIndex - 1,
-    PrevLogTerm = raft_log:at(PrevLogIndex),
+    PrevLogTerm = raft_log:at(Log, PrevLogIndex),
     Entries = raft_log:sublist(Log, NextIndex),
     {rpc, append_entries, Term, {Id, PrevLogIndex, PrevLogTerm, Entries, raft_log:commit_index(Log)}}.
 
@@ -231,12 +248,14 @@ parse_args([], State) -> State.
 peers(#state{id=Id,cluster=Cluster}) ->
     Cluster -- [{local, Id}].
 
+%% Update Commit Index (call this from check_followers)
+
 %% MOCK
 
 % TODO: Make this probabilistically fail
 send(To, Data) when is_atom(To) ->
-	io:format("Sending: ~p to ~p~n", [Data, To]),
+	%io:format("Sending: ~p to ~p~n", [Data, To]),
     gen_statem:cast(To,Data);
 send({local, To}, Data) ->
-	io:format("Sending: ~p to ~p~n", [Data, To]),
+	%io:format("Sending: ~p to ~p~n", [Data, To]),
     gen_statem:cast(To,Data).
